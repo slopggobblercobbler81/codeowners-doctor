@@ -2,14 +2,13 @@ name: CI
 
 on:
   push:
-    branches: [main, master]
+    branches: [ main, master ]
   pull_request:
-    branches: [main, master]
-  workflow_dispatch:
+    branches: [ main, master ]
 
 jobs:
   test:
-    name: Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    name: Test on Python ${{ matrix.python-version }} (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
@@ -18,7 +17,7 @@ jobs:
         python-version: ["3.8", "3.9", "3.10", "3.11", "3.12"]
 
     steps:
-      - name: Checkout repository
+      - name: Check out repository
         uses: actions/checkout@v4
 
       - name: Set up Python ${{ matrix.python-version }}
@@ -26,20 +25,15 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
 
-      - name: Install dependencies
+      - name: Install package and test dependencies
         run: |
-          python -m pip install --upgrade pip setuptools wheel
+          python -m pip install --upgrade pip
           pip install -e ".[dev]"
 
       - name: Run test suite with pytest
         run: |
-          pytest -v --cov=codeowners_doctor
+          pytest -v --durations=10
 
-      - name: Verify CLI execution
+      - name: Dogfood CLI check
         run: |
-          codeowners-doctor --version
-          codeowners-doctor --help
-          codeowners-doctor init --out test_codeowners --default-owner @org/core
-          codeowners-doctor check test_codeowners
-          codeowners-doctor who README.md --file test_codeowners
-          codeowners-doctor format test_codeowners
+          codeowners-doctor check --strict

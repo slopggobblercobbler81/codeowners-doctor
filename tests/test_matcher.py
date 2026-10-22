@@ -1,132 +1,104 @@
-"""Unit tests for CODEOWNERS matcher."""
-
+"""Tests for CODEOWNERS pattern matching engine."""
 import pytest
-from codeowners_doctor.parser import parse_codeowners
-from codeowners_doctor.matcher import CodeownersMatcher, normalize_repo_path, pattern_to_regex
+
+from codeowners_doctor.matcher import CodeOwnersMatcher, compile_pattern_to_regex
+from codeowners_doctor.models import CodeOwnersLine, LineType
 
 
-def test_normalize_repo_path():
-    assert normalize_repo_path("./foo/bar.txt") == "foo/bar.txt"
-    assert normalize_repo_path("/foo/bar.txt") == "foo/bar.txt"
-    assert normalize_repo_path(r"foo\bar\baz.txt") == "foo/bar/baz.txt"
-    assert normalize_repo_path("  file.txt  ") == "file.txt"
+def test_compile_pattern_universal_wildcard():
+    regex = compile_pattern_to_regex("*")
+    assert regex.match("foo.txt")
+    assert regex.match("nested/folder/bar.py")
+    assert regex.match("a/b/c/d/e")
 
 
-def test_matcher_wildcard_default():
-    content = "* @default"
-    matcher = CodeownersMatcher(parse_codeowners(content))
+def test_compile_pattern_root_only():
+    regex = compile_pattern_to_regex("/*")
+    assert regex.match("foo.txt")
+    assert regex.match("LICENSE")
+    assert not regex.match("nested/folder.txt")
+    assert not regex.match("a/b")
 
-    assert matcher.get_owners("README.md") == ("@default",)
-    assert matcher.get_owners("src/index.js") == ("@default",)
-    assert matcher.get_owners("deep/nested/path/to/file.py") == ("@default",)
+
+def test_compile_pattern_extension():
+    regex = compile_pattern_to_regex("*.js")
+    assert regex.match("app.js")
+    assert regex.match("src/main.js")
+    assert regex.match("src/sub/util.js")
+    assert not regex.match("src/main.ts")
+    assert not regex.match("app.json")
 
 
-def test_matcher_order_precedence():
-    content = """
-* @everyone
-*.js @js-team
-/src/special.js @alice
-"""
-    matcher = CodeownersMatcher(parse_codeowners(content))
+def test_compile_pattern_directory_trailing_slash():
+    # apps/ matches any apps directory
+    regex = compile_pattern_to_regex("apps/")
+    assert regex.match("apps/foo.py")
+    assert regex.match("build/apps/bar.py")
+    assert regex.match("sub/level/apps/test.js")
+
+    # /apps/ matches only at root
+    regex_root = compile_pattern_to_regex("/apps/")
+    assert regex_root.match("apps/foo.py")
+    assert not regex_root.match("build/apps/bar.py")
+
+
+def test_compile_pattern_double_star():
+    regex = compile_pattern_to_regex("src/**/models/*.py")
+    assert regex.match("src/models/user.py")
+    assert regex.match("src/sub/pkg/models/item.py")
+    assert not regex.match("other/models/user.py")
+
+
+def test_matcher_precedence_last_rule_wins():
+    rules = [
+        CodeOwnersLine(1, "* @global", LineType.RULE, pattern="*", owners=["@global"]),
+        CodeOwnersLine(2, "*.js @js-team", LineType.RULE, pattern="*.js", owners=["@js-team"]),
+        CodeOwnersLine(3, "/docs/* @docs-team", LineType.RULE, pattern="/docs/*", owners=["@docs-team"]),
+        CodeOwnersLine(4, "/docs/architecture.md @architect", LineType.RULE, pattern="/docs/architecture.md", owners=["@architect"]),
+    ]
+    matcher = CodeOwnersMatcher(rules)
 
     # General file
-    assert matcher.get_owners("README.md") == ("@everyone",)
-    # JS file elsewhere
-    assert matcher.get_owners("lib/util.js") == ("@js-team",)
-    # Root js file
-    assert matcher.get_owners("index.js") == ("@js-team",)
-    # Most specific winning rule
-    assert matcher.get_owners("src/special.js") == ("@alice",)
+    res = matcher.match_file("README.md")
+    assert res.matched
+    assert res.owners == ["@global"]
+
+    # JS file matches *.js over *
+    res = matcher.match_file("src/app.js")
+    assert res.matched
+    assert res.owners == ["@js-team"]
+    assert res.rule_line_number == 2
+
+    # docs file
+    res = matcher.match_file("docs/guide.md")
+    assert res.matched
+    assert res.owners == ["@docs-team"]
+    assert res.rule_line_number == 3
+
+    # specific file overrides /docs/*
+    res = matcher.match_file("docs/architecture.md")
+    assert res.matched
+    assert res.owners == ["@architect"]
+    assert res.rule_line_number == 4
 
 
-def test_matcher_anchored_vs_unanchored():
-    content = """
-/docs/ @root-docs
-images/ @any-images
-build/ @any-build
-"""
-    matcher = CodeownersMatcher(parse_codeowners(content))
-
-    # /docs/ is anchored at root
-    assert matcher.get_owners("docs/intro.md") == ("@root-docs",)
-    assert matcher.get_owners("packages/app/docs/intro.md") == ()
-
-    # images/ is unanchored (matches anywhere)
-    assert matcher.get_owners("images/logo.png") == ("@any-images",)
-    assert matcher.get_owners("assets/images/logo.png") == ("@any-images",)
-
-    # build/
-    assert matcher.get_owners("build/output.js") == ("@any-build",)
-    assert matcher.get_owners("src/build/output.js") == ("@any-build",)
-
-
-def test_matcher_unowned_rule():
-    content = """
-* @maintainers
-/secrets/
-"""
-    matcher = CodeownersMatcher(parse_codeowners(content))
-
-    assert matcher.get_owners("app.py") == ("@maintainers",)
-    assert matcher.is_owned("app.py") is True
-
-    # /secrets/ matches and explicitly clears ownership
-    assert matcher.get_owners("secrets/keys.txt") == ()
-    assert matcher.is_owned("secrets/keys.txt") is False
-
-
-def test_matcher_double_asterisk():
-    content = """
-apps/**/tests/ @qa-team
-"""
-    matcher = CodeownersMatcher(parse_codeowners(content))
-
-    assert matcher.get_owners("apps/api/tests/test_api.py") == ("@qa-team",)
-    assert matcher.get_owners("apps/web/client/tests/test_client.py") == ("@qa-team",)
-    assert matcher.get_owners("apps/api/src/server.py") == ()
-
-
-def test_matcher_find_all_matching_rules():
-    content = """
-* @all
-*.py @python-devs
-/src/app.py @lead
-"""
-    matcher = CodeownersMatcher(parse_codeowners(content))
-    matches = matcher.find_all_matching_rules("src/app.py")
-    assert len(matches) == 3
-    assert matches[0].pattern == "*"
-    assert matches[1].pattern == "*.py"
-    assert matches[2].pattern == "/src/app.py"
-
-    # Effective rule is the last one
-    assert matcher.find_matching_rule("src/app.py").pattern == "/src/app.py"
-
-
-def test_matcher_direct_rules_list():
-    from codeowners_doctor.parser import CodeownersRule
+def test_matcher_windows_paths():
     rules = [
-        CodeownersRule(pattern="*.rs", owners=("@rustacean",), line_number=1, raw_line="*.rs @rustacean"),
-        CodeownersRule(pattern="README.md", owners=(), line_number=2, raw_line="README.md"),
+        CodeOwnersLine(1, "src/**/*.py @python-team", LineType.RULE, pattern="src/**/*.py", owners=["@python-team"]),
     ]
-    matcher = CodeownersMatcher(rules)
-    assert matcher.get_owners("main.rs") == ("@rustacean",)
-    assert matcher.is_owned("main.rs") is True
-    assert matcher.get_owners("README.md") == ()
-    assert matcher.is_owned("README.md") is False
-    assert matcher.get_owners("unknown.txt") == ()
-    assert matcher.find_matching_rule("unknown.txt") is None
+    matcher = CodeOwnersMatcher(rules)
+    res = matcher.match_file(r"src\services\auth.py")
+    assert res.matched
+    assert res.owners == ["@python-team"]
+    assert res.file_path == "src/services/auth.py"
 
 
-def test_pattern_to_regex_special_cases():
-    # Empty pattern
-    assert pattern_to_regex("").pattern == "^$"
-
-    # Escaped characters
-    reg_space = pattern_to_regex(r"my\ file.txt")
-    assert reg_space.match("my file.txt")
-
-    # Question mark
-    reg_q = pattern_to_regex("file?.txt")
-    assert reg_q.match("file1.txt")
-    assert not reg_q.match("file12.txt")
+def test_matcher_no_match():
+    rules = [
+        CodeOwnersLine(1, "/specific/dir/ @team", LineType.RULE, pattern="/specific/dir/", owners=["@team"]),
+    ]
+    matcher = CodeOwnersMatcher(rules)
+    res = matcher.match_file("other/path.txt")
+    assert not res.matched
+    assert res.owners == []
+    assert res.rule_line_number is None

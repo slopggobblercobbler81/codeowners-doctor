@@ -1,142 +1,100 @@
-"""Unit tests for CODEOWNERS linter."""
+"""Tests for CODEOWNERS linter and diagnostics."""
+from pathlib import Path
+from tempfile import TemporaryDirectory
 
 import pytest
-from codeowners_doctor.linter import CodeownersLinter, IssueSeverity, LintIssue
+
+from codeowners_doctor.linter import CodeOwnersLinter
+from codeowners_doctor.models import DiagnosticSeverity
+from codeowners_doctor.parser import CodeOwnersParser
 
 
-def test_clean_codeowners():
-    content = """# Clean CODEOWNERS
-* @org/team
-/docs/ @docs-team
-*.py dev@example.com
-"""
-    linter = CodeownersLinter(check_dead_rules=False, check_critical_paths=False)
-    report = linter.lint(content)
-
-    assert report.is_clean
-    assert len(report.issues) == 0
-    assert not report.has_errors
-    assert report.total_rules == 3
-
-
-def test_trailing_whitespace_issue():
-    content = "* @team   \n/docs/ @docs\t"
-    linter = CodeownersLinter(check_dead_rules=False, check_critical_paths=False)
-    report = linter.lint(content)
-
-    ws_issues = [i for i in report.issues if i.code == "TRAILING_WHITESPACE"]
-    assert len(ws_issues) == 2
-    assert ws_issues[0].line_number == 1
-    assert ws_issues[1].line_number == 2
-
-
-def test_invalid_owner_format():
+def test_linter_empty_rule_and_invalid_owner():
     content = """
-* valid-user-missing-at
-*.js @valid-team
-/src/ invalid@notanemail
+# Missing owner
+*.py
+
+# Invalid owner token
+*.js @alice not_an_owner
+
+# Valid rule
+*.go @gopher
 """
-    linter = CodeownersLinter(check_dead_rules=False, check_critical_paths=False)
-    report = linter.lint(content)
+    lines = CodeOwnersParser.parse_text(content)
+    linter = CodeOwnersLinter(lines)
+    diagnostics = linter.run_all()
 
-    errs = [i for i in report.issues if i.code == "OWNER_FORMAT_INVALID"]
-    assert len(errs) == 2
-    assert report.has_errors
-
-
-def test_duplicate_owner_on_rule():
-    content = "*.py @alice @bob @alice"
-    linter = CodeownersLinter(check_dead_rules=False, check_critical_paths=False)
-    report = linter.lint(content)
-
-    dups = [i for i in report.issues if i.code == "DUPLICATE_OWNER"]
-    assert len(dups) == 1
-    assert "Duplicate owner '@alice'" in dups[0].message
+    codes = [d.code for d in diagnostics]
+    assert "E002" in codes  # Missing owner
+    assert "E003" in codes  # Invalid owner token
 
 
-def test_duplicate_identical_rules():
+def test_linter_duplicate_owners():
+    content = "*.ts @alice @bob @alice @Bob"
+    lines = CodeOwnersParser.parse_text(content)
+    linter = CodeOwnersLinter(lines)
+    diagnostics = linter.run_all()
+
+    dup_diags = [d for d in diagnostics if d.code == "W001"]
+    assert len(dup_diags) == 1
+    assert "Duplicate owner" in dup_diags[0].message
+
+
+def test_linter_redundant_wildcards():
     content = """
-/docs/ @docs-team
-/docs/ @docs-team
+./scripts/* @devops
+src/**/**/main.py @lead
 """
-    linter = CodeownersLinter(check_dead_rules=False, check_critical_paths=False)
-    report = linter.lint(content)
+    lines = CodeOwnersParser.parse_text(content)
+    linter = CodeOwnersLinter(lines)
+    diagnostics = linter.run_all()
 
-    dups = [i for i in report.issues if i.code == "DUPLICATE_RULE"]
-    assert len(dups) == 1
-    assert dups[0].line_number == 3
+    w005 = [d for d in diagnostics if d.code == "W005"]
+    assert len(w005) == 2
 
 
-def test_shadowed_rule_warning():
+def test_linter_shadowed_rules():
     content = """
-/docs/ @alice
-/src/ @bob
-/docs/ @charlie
+/docs/* @writer
+/docs/* @lead-writer
+*.py @python-dev
+* @all-powerful
 """
-    linter = CodeownersLinter(check_dead_rules=False, check_critical_paths=False)
-    report = linter.lint(content)
+    lines = CodeOwnersParser.parse_text(content)
+    linter = CodeOwnersLinter(lines)
+    diagnostics = linter.run_all()
 
-    shadowed = [i for i in report.issues if i.code == "SHADOWED_RULE"]
-    assert len(shadowed) == 1
-    assert shadowed[0].line_number == 2  # line 2 (/docs/ @alice) is shadowed by line 4
+    w002 = [d for d in diagnostics if d.code == "W002"]
+    # 1. line 2 /docs/* is shadowed by line 3 /docs/*
+    # 2. line 4 *.py is shadowed by line 5 catch-all '*'
+    assert len(w002) >= 2
 
 
-def test_dead_rule_detection():
-    content = """
-/exists.py @alice
-/ghost.py @bob
+def test_linter_orphan_patterns_and_unowned():
+    with TemporaryDirectory() as tmpdir:
+        root = Path(tmpdir)
+        (root / "src").mkdir()
+        (root / "src" / "index.js").write_text("console.log('hi');")
+        (root / "docs").mkdir()
+        (root / "docs" / "readme.md").write_text("# Doc")
+        (root / "secret.key").write_text("xyz")
+
+        codeowners = """
+# Existing
+src/*.js @js-team
+docs/* @docs-team
+
+# Orphan pattern (no ruby files exist)
+*.rb @ruby-team
 """
-    files = ["exists.py", "readme.md"]
-    linter = CodeownersLinter(files_list=files, check_dead_rules=True, check_critical_paths=False)
-    report = linter.lint(content)
+        lines = CodeOwnersParser.parse_text(codeowners)
+        linter = CodeOwnersLinter(lines, repo_root=root)
+        diagnostics = linter.run_all(check_unowned=True)
 
-    dead = [i for i in report.issues if i.code == "DEAD_RULE"]
-    assert len(dead) == 1
-    assert dead[0].rule.pattern == "/ghost.py"
+        orphan_diags = [d for d in diagnostics if d.code == "W003"]
+        assert len(orphan_diags) == 1
+        assert "*.rb" in orphan_diags[0].message
 
-
-def test_critical_paths_unowned():
-    content = """
-/docs/ @docs-team
-"""
-    files = [".github/workflows/ci.yml", "docs/index.md"]
-    linter = CodeownersLinter(files_list=files, check_dead_rules=False, check_critical_paths=True)
-    report = linter.lint(content)
-
-    crit = [i for i in report.issues if i.code == "UNOWNED_CRITICAL_PATH"]
-    assert len(crit) == 1
-    assert "ci.yml" in crit[0].message
-
-
-def test_sarif_export():
-    content = "*.py invalid_owner"
-    linter = CodeownersLinter(check_dead_rules=False, check_critical_paths=False)
-    report = linter.lint(content)
-
-    sarif = report.to_sarif()
-    assert sarif["version"] == "2.1.0"
-    assert len(sarif["runs"]) == 1
-    assert len(sarif["runs"][0]["results"]) >= 1
-    assert sarif["runs"][0]["results"][0]["ruleId"] == "OWNER_FORMAT_INVALID"
-
-
-def test_backslash_in_pattern_and_missing_owners():
-    content = r"""
-src\\models\\file.py @team
-/unowned/
-"""
-    linter = CodeownersLinter(check_dead_rules=False, check_critical_paths=False)
-    report = linter.lint(content)
-
-    bs = [i for i in report.issues if i.code == "BACKSLASH_IN_PATTERN"]
-    assert len(bs) == 1
-    assert "src/models/file.py" in bs[0].suggestion
-
-    missing = [i for i in report.issues if i.code == "MISSING_OWNERS"]
-    assert len(missing) == 1
-    assert missing[0].severity == IssueSeverity.INFO
-
-    # Check to_dict on issue
-    d = bs[0].to_dict()
-    assert d["code"] == "BACKSLASH_IN_PATTERN"
-    assert d["severity"] == "warning"
+        unowned_diags = [d for d in diagnostics if d.code == "W004"]
+        assert len(unowned_diags) == 1
+        assert "secret.key" in unowned_diags[0].message

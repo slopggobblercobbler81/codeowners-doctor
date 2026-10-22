@@ -1,349 +1,316 @@
-"""Linter and diagnostics engine for CODEOWNERS files."""
-
+"""Linter and diagnostics engine for CODEOWNERS."""
 from __future__ import annotations
-import enum
+
 import os
 import re
-from dataclasses import dataclass, field
+import subprocess
 from pathlib import Path
-from typing import Dict, List, Optional, Sequence, Set, Tuple
+from typing import List, Optional, Set
 
-from .parser import CodeownersRule, ParsedCodeowners, is_valid_owner, parse_codeowners
-from .matcher import CodeownersMatcher, pattern_to_regex, normalize_repo_path
-
-
-class IssueSeverity(str, enum.Enum):
-    ERROR = "error"
-    WARNING = "warning"
-    INFO = "info"
-
-
-@dataclass
-class LintIssue:
-    """Represents a diagnostic issue discovered in a CODEOWNERS file."""
-    code: str
-    message: str
-    severity: IssueSeverity
-    line_number: Optional[int] = None
-    rule: Optional[CodeownersRule] = None
-    suggestion: Optional[str] = None
-
-    def to_dict(self) -> dict:
-        return {
-            "code": self.code,
-            "message": self.message,
-            "severity": self.severity.value,
-            "line_number": self.line_number,
-            "pattern": self.rule.pattern if self.rule else None,
-            "suggestion": self.suggestion,
-        }
+from codeowners_doctor.matcher import CodeOwnersMatcher, compile_pattern_to_regex
+from codeowners_doctor.models import (
+    CodeOwnersLine,
+    Diagnostic,
+    DiagnosticSeverity,
+    LineType,
+    OwnerKind,
+)
+from codeowners_doctor.parser import CodeOwnersParser
 
 
-@dataclass
-class LintReport:
-    """Aggregated lint results and metrics."""
-    issues: List[LintIssue] = field(default_factory=list)
-    total_rules: int = 0
-    total_lines: int = 0
-    repo_scanned: Optional[str] = None
-
-    @property
-    def errors(self) -> List[LintIssue]:
-        return [i for i in self.issues if i.severity == IssueSeverity.ERROR]
-
-    @property
-    def warnings(self) -> List[LintIssue]:
-        return [i for i in self.issues if i.severity == IssueSeverity.WARNING]
-
-    @property
-    def infos(self) -> List[LintIssue]:
-        return [i for i in self.issues if i.severity == IssueSeverity.INFO]
-
-    @property
-    def has_errors(self) -> bool:
-        return len(self.errors) > 0
-
-    @property
-    def is_clean(self) -> bool:
-        return len(self.issues) == 0
-
-    def to_dict(self) -> dict:
-        return {
-            "is_clean": self.is_clean,
-            "total_rules": self.total_rules,
-            "total_lines": self.total_lines,
-            "error_count": len(self.errors),
-            "warning_count": len(self.warnings),
-            "info_count": len(self.infos),
-            "issues": [i.to_dict() for i in self.issues],
-        }
-
-    def to_sarif(self) -> dict:
-        """Convert lint report to SARIF format for GitHub Code Scanning."""
-        rules_map = {}
-        results = []
-
-        for issue in self.issues:
-            rule_id = issue.code
-            if rule_id not in rules_map:
-                rules_map[rule_id] = {
-                    "id": rule_id,
-                    "name": rule_id.replace("_", " ").title(),
-                    "shortDescription": {"text": issue.message},
-                    "defaultConfiguration": {
-                        "level": "error" if issue.severity == IssueSeverity.ERROR else "warning"
-                    },
-                }
-
-            level = "error" if issue.severity == IssueSeverity.ERROR else (
-                "warning" if issue.severity == IssueSeverity.WARNING else "note"
-            )
-
-            result = {
-                "ruleId": rule_id,
-                "level": level,
-                "message": {"text": issue.message},
-                "locations": [
-                    {
-                        "physicalLocation": {
-                            "artifactLocation": {"uri": "CODEOWNERS"},
-                            "region": {
-                                "startLine": issue.line_number or 1,
-                                "startColumn": 1,
-                            },
-                        }
-                    }
-                ],
-            }
-            results.append(result)
-
-        return {
-            "$schema": "https://raw.githubusercontent.com/oasis-tcs/sarif-spec/master/Schemata/sarif-schema-2.1.0.json",
-            "version": "2.1.0",
-            "runs": [
-                {
-                    "tool": {
-                        "driver": {
-                            "name": "codeowners-doctor",
-                            "version": "0.1.0",
-                            "rules": list(rules_map.values()),
-                        }
-                    },
-                    "results": results,
-                }
-            ],
-        }
+IGNORED_DIRS = {
+    ".git",
+    "node_modules",
+    ".pytest_cache",
+    ".mypy_cache",
+    "__pycache__",
+    ".venv",
+    "venv",
+    ".tox",
+    "dist",
+    "build",
+}
 
 
-CRITICAL_SECURITY_PATHS = [
-    ".github/workflows",
-    ".github/CODEOWNERS",
-    "CODEOWNERS",
-    "Dockerfile",
-    "docker-compose.yml",
-    "security",
-    "auth",
-]
+def get_repository_files(repo_root: Path) -> List[str]:
+    """Retrieves all tracked or existing files in repository, normalized to POSIX relative paths."""
+    # Try git ls-files first if git repository
+    try:
+        proc = subprocess.run(
+            ["git", "ls-files", "--cached", "--others", "--exclude-standard"],
+            cwd=str(repo_root),
+            capture_output=True,
+            text=True,
+            check=False,
+        )
+        if proc.returncode == 0 and proc.stdout.strip():
+            files = [
+                CodeOwnersMatcher.normalize_path(line)
+                for line in proc.stdout.splitlines()
+                if line.strip()
+            ]
+            if files:
+                return files
+    except Exception:
+        pass
+
+    # Fallback to filesystem walk
+    files = []
+    for root, dirs, filenames in os.walk(repo_root):
+        # Prune ignored directories
+        dirs[:] = [d for d in dirs if d not in IGNORED_DIRS and d != ".git" and not d.startswith(".git/")]
+        rel_root = Path(root).relative_to(repo_root)
+
+        for fname in filenames:
+            rel_path = (rel_root / fname).as_posix()
+            if rel_path.startswith("./"):
+                rel_path = rel_path[2:]
+            files.append(rel_path)
+
+    return sorted(files)
 
 
-class CodeownersLinter:
-    """Comprehensive linter verifying syntax, logic, coverage, and dead rules."""
+class CodeOwnersLinter:
+    """Performs validation, syntax checking, and static analysis on CODEOWNERS."""
 
     def __init__(
         self,
-        repo_dir: Optional[str | Path] = None,
-        files_list: Optional[Sequence[str]] = None,
-        check_dead_rules: bool = True,
-        check_critical_paths: bool = True,
-    ) -> None:
-        self.repo_dir = Path(repo_dir) if repo_dir else None
-        self.files_list = list(files_list) if files_list is not None else None
-        self.check_dead_rules = check_dead_rules
-        self.check_critical_paths = check_critical_paths
+        lines: List[CodeOwnersLine],
+        repo_root: Optional[Path] = None,
+        codeowners_path: Optional[Path] = None,
+    ):
+        self.lines = lines
+        self.repo_root = repo_root
+        self.codeowners_path = codeowners_path
+        self.diagnostics: List[Diagnostic] = []
 
-    def _discover_repo_files(self) -> List[str]:
-        """Discover existing tracked or visible files in repository."""
-        if self.files_list is not None:
-            return self.files_list
+    def run_all(self, check_unowned: bool = False) -> List[Diagnostic]:
+        """Runs all lint checks and returns a list of diagnostics."""
+        self.diagnostics.clear()
 
-        if not self.repo_dir or not self.repo_dir.is_dir():
-            return []
+        self.check_syntax_and_owners()
+        self.check_duplicate_owners()
+        self.check_redundant_wildcards()
+        self.check_shadowed_rules()
 
-        discovered: List[str] = []
-        ignored_dirs = {".git", ".pytest_cache", ".mypy_cache", "__pycache__", "node_modules", "venv", ".venv"}
+        if self.repo_root and self.repo_root.is_dir():
+            repo_files = get_repository_files(self.repo_root)
+            self.check_orphan_patterns(repo_files)
+            if check_unowned:
+                self.check_unowned_files(repo_files)
 
-        for root, dirs, files in os.walk(self.repo_dir):
-            dirs[:] = [d for d in dirs if d not in ignored_dirs]
-            rel_dir = os.path.relpath(root, self.repo_dir)
+        return self.diagnostics
 
-            for f in files:
-                rel_path = f if rel_dir == "." else os.path.join(rel_dir, f)
-                discovered.append(normalize_repo_path(rel_path))
+    def check_syntax_and_owners(self) -> None:
+        """Checks for pattern compilation errors, empty rules, and invalid owner formats."""
+        for line in self.lines:
+            if line.line_type != LineType.RULE:
+                continue
 
-        return discovered
+            if not line.pattern:
+                self.diagnostics.append(
+                    Diagnostic(
+                        code="E001",
+                        message="Rule line has no pattern specified.",
+                        severity=DiagnosticSeverity.ERROR,
+                        line_number=line.line_number,
+                        rule_line=line.raw,
+                    )
+                )
+                continue
 
-    def lint(self, content_or_parsed: str | ParsedCodeowners) -> LintReport:
-        """Run all lint rules against CODEOWNERS content."""
-        if isinstance(content_or_parsed, str):
-            parsed = parse_codeowners(content_or_parsed)
-            raw_lines = content_or_parsed.splitlines()
-        else:
-            parsed = content_or_parsed
-            raw_lines = parsed.raw_lines
-
-        report = LintReport(
-            total_rules=len(parsed.rules),
-            total_lines=len(raw_lines),
-            repo_scanned=str(self.repo_dir) if self.repo_dir else None,
-        )
-
-        # 1. Line-level hygiene checks (trailing whitespace, backslashes)
-        for idx, line in enumerate(raw_lines, start=1):
-            if line.endswith(" ") or line.endswith("\t"):
-                report.issues.append(
-                    LintIssue(
-                        code="TRAILING_WHITESPACE",
-                        message=f"Line {idx} contains trailing whitespace.",
-                        severity=IssueSeverity.WARNING,
-                        line_number=idx,
-                        suggestion="Remove trailing whitespace.",
+            # Verify pattern compiles to regex
+            try:
+                compile_pattern_to_regex(line.pattern)
+            except Exception as e:
+                self.diagnostics.append(
+                    Diagnostic(
+                        code="E001",
+                        message=f"Invalid pattern syntax '{line.pattern}': {e}",
+                        severity=DiagnosticSeverity.ERROR,
+                        line_number=line.line_number,
+                        rule_line=line.raw,
                     )
                 )
 
-        # 2. Rule-level syntax & owner checks
-        seen_exact_rules: Dict[Tuple[str, Tuple[str, ...]], int] = {}
-        patterns_to_rules: Dict[str, List[CodeownersRule]] = {}
+            # Check if owners are missing
+            if not line.owners:
+                self.diagnostics.append(
+                    Diagnostic(
+                        code="E002",
+                        message=f"Pattern '{line.pattern}' has no code owners defined.",
+                        severity=DiagnosticSeverity.ERROR,
+                        line_number=line.line_number,
+                        suggestion="Specify at least one owner (e.g., @username, @org/team, or user@example.com).",
+                        rule_line=line.raw,
+                    )
+                )
+                continue
 
-        for rule in parsed.rules:
-            patterns_to_rules.setdefault(rule.pattern, []).append(rule)
+            # Validate each owner token
+            for parsed_owner in line.parsed_owners:
+                if parsed_owner.kind == OwnerKind.INVALID:
+                    self.diagnostics.append(
+                        Diagnostic(
+                            code="E003",
+                            message=f"Invalid owner format '{parsed_owner.raw}'.",
+                            severity=DiagnosticSeverity.ERROR,
+                            line_number=line.line_number,
+                            suggestion="Owners must be a GitHub user (@user), team (@org/team), or valid email address.",
+                            rule_line=line.raw,
+                        )
+                    )
 
-            # Check backslashes in pattern
-            if "\\" in rule.pattern and not any(f"\\{c}" in rule.pattern for c in (" ", "#", "[", "]", "*")):
-                fixed_pattern = rule.pattern.replace("\\", "/")
-                report.issues.append(
-                    LintIssue(
-                        code="BACKSLASH_IN_PATTERN",
-                        message=f"Line {rule.line_number}: Pattern '{rule.pattern}' contains unescaped backslashes. CODEOWNERS uses forward slashes '/'.",
-                        severity=IssueSeverity.WARNING,
-                        line_number=rule.line_number,
-                        rule=rule,
-                        suggestion=f"Replace '\\' with '/': '{fixed_pattern}'",
+    def check_duplicate_owners(self) -> None:
+        """Flags lines where the same owner is declared multiple times."""
+        for line in self.lines:
+            if line.line_type != LineType.RULE:
+                continue
+
+            seen: Set[str] = set()
+            duplicates: Set[str] = set()
+            for o in line.owners:
+                norm_o = o.lower()
+                if norm_o in seen:
+                    duplicates.add(o)
+                seen.add(norm_o)
+
+            if duplicates:
+                dup_str = ", ".join(sorted(duplicates))
+                self.diagnostics.append(
+                    Diagnostic(
+                        code="W001",
+                        message=f"Duplicate owner(s) on line: {dup_str}",
+                        severity=DiagnosticSeverity.WARNING,
+                        line_number=line.line_number,
+                        suggestion="Remove redundant owner declarations on this line.",
+                        rule_line=line.raw,
                     )
                 )
 
-            # Check empty owners (explicit unowning vs possible mistake)
-            if not rule.owners:
-                report.issues.append(
-                    LintIssue(
-                        code="MISSING_OWNERS",
-                        message=f"Line {rule.line_number}: Pattern '{rule.pattern}' specifies no owners (clears ownership).",
-                        severity=IssueSeverity.INFO,
-                        line_number=rule.line_number,
-                        rule=rule,
-                        suggestion="Assign at least one @user or @team if this wasn't intentional.",
+    def check_redundant_wildcards(self) -> None:
+        """Checks for strange or redundant wildcards like './pattern' or '**/**'."""
+        for line in self.lines:
+            if line.line_type != LineType.RULE or not line.pattern:
+                continue
+
+            if line.pattern.startswith("./"):
+                self.diagnostics.append(
+                    Diagnostic(
+                        code="W005",
+                        message=f"Pattern '{line.pattern}' has redundant leading './'.",
+                        severity=DiagnosticSeverity.WARNING,
+                        line_number=line.line_number,
+                        suggestion=f"Change to '{line.pattern[2:]}' or '/{line.pattern[2:]}'.",
+                        rule_line=line.raw,
                     )
                 )
 
-            # Check owner validity & duplicate owners on same rule
-            seen_rule_owners: Set[str] = set()
-            for owner in rule.owners:
-                if not is_valid_owner(owner):
-                    report.issues.append(
-                        LintIssue(
-                            code="OWNER_FORMAT_INVALID",
-                            message=f"Line {rule.line_number}: Invalid owner format '{owner}'. Expected @username, @org/team, or user@domain.com.",
-                            severity=IssueSeverity.ERROR,
-                            line_number=rule.line_number,
-                            rule=rule,
-                            suggestion=f"Prefix username with '@' or format as valid email: '@{owner}'",
-                        )
-                    )
-
-                if owner in seen_rule_owners:
-                    report.issues.append(
-                        LintIssue(
-                            code="DUPLICATE_OWNER",
-                            message=f"Line {rule.line_number}: Duplicate owner '{owner}' specified on same pattern.",
-                            severity=IssueSeverity.WARNING,
-                            line_number=rule.line_number,
-                            rule=rule,
-                            suggestion=f"Remove duplicate '{owner}'.",
-                        )
-                    )
-                seen_rule_owners.add(owner)
-
-            # Check duplicate exact rules
-            rule_key = (rule.pattern, rule.owners)
-            if rule_key in seen_exact_rules:
-                prev_line = seen_exact_rules[rule_key]
-                report.issues.append(
-                    LintIssue(
-                        code="DUPLICATE_RULE",
-                        message=f"Line {rule.line_number}: Duplicate rule for '{rule.pattern}' identical to line {prev_line}.",
-                        severity=IssueSeverity.WARNING,
-                        line_number=rule.line_number,
-                        rule=rule,
-                        suggestion=f"Remove redundant duplicate rule on line {rule.line_number}.",
+            if "**/**" in line.pattern:
+                self.diagnostics.append(
+                    Diagnostic(
+                        code="W005",
+                        message=f"Pattern '{line.pattern}' contains redundant '**/**'.",
+                        severity=DiagnosticSeverity.WARNING,
+                        line_number=line.line_number,
+                        suggestion="Replace '**/**' with '**'.",
+                        rule_line=line.raw,
                     )
                 )
-            else:
-                seen_exact_rules[rule_key] = rule.line_number
 
-        # 3. Shadowed rules analysis
-        # If the same pattern appears multiple times with DIFFERENT owners, earlier occurrences are shadowed
-        for pattern, rule_group in patterns_to_rules.items():
-            if len(rule_group) > 1:
-                # All except the last rule are shadowed by the last rule
-                last_rule = rule_group[-1]
-                for shadowed in rule_group[:-1]:
-                    if shadowed.owners != last_rule.owners:
-                        report.issues.append(
-                            LintIssue(
-                                code="SHADOWED_RULE",
-                                message=(
-                                    f"Line {shadowed.line_number}: Rule for '{pattern}' is shadowed and completely "
-                                    f"overridden by line {last_rule.line_number}."
-                                ),
-                                severity=IssueSeverity.WARNING,
-                                line_number=shadowed.line_number,
-                                rule=shadowed,
-                                suggestion=f"Consolidate with line {last_rule.line_number} or reorder.",
-                            )
-                        )
+    def check_shadowed_rules(self) -> None:
+        """Flags earlier rules that are completely shadowed or overwritten by later rules."""
+        rules = [l for l in self.lines if l.line_type == LineType.RULE and l.pattern]
 
-        # 4. Dead rules detection (requires repository files)
-        repo_files = self._discover_repo_files()
-        if self.check_dead_rules and repo_files:
-            for rule in parsed.rules:
-                reg = pattern_to_regex(rule.pattern)
-                has_match = any(reg.match(f) for f in repo_files)
-                if not has_match:
-                    report.issues.append(
-                        LintIssue(
-                            code="DEAD_RULE",
-                            message=f"Line {rule.line_number}: Pattern '{rule.pattern}' matched 0 files in repository.",
-                            severity=IssueSeverity.WARNING,
-                            line_number=rule.line_number,
-                            rule=rule,
-                            suggestion="Remove dead rule or update pattern to match existing paths.",
+        for i, rule1 in enumerate(rules):
+            p1 = rule1.pattern.strip()
+            # Compare with subsequent rules
+            for rule2 in rules[i + 1 :]:
+                p2 = rule2.pattern.strip()
+
+                # Identical pattern later completely shadows earlier pattern
+                if p1 == p2:
+                    self.diagnostics.append(
+                        Diagnostic(
+                            code="W002",
+                            message=(
+                                f"Rule '{p1}' on line {rule1.line_number} is completely shadowed by "
+                                f"identical pattern on line {rule2.line_number}."
+                            ),
+                            severity=DiagnosticSeverity.WARNING,
+                            line_number=rule1.line_number,
+                            suggestion="Remove or reorder the earlier duplicate pattern.",
+                            rule_line=rule1.raw,
                         )
                     )
+                    break
 
-        # 5. Critical paths check
-        if self.check_critical_paths and repo_files:
-            matcher = CodeownersMatcher(parsed)
-            for crit_prefix in CRITICAL_SECURITY_PATHS:
-                matching_files = [f for f in repo_files if f.startswith(crit_prefix)]
-                for mf in matching_files:
-                    if not matcher.is_owned(mf):
-                        report.issues.append(
-                            LintIssue(
-                                code="UNOWNED_CRITICAL_PATH",
-                                message=f"Critical path '{mf}' has no assigned owner in CODEOWNERS.",
-                                severity=IssueSeverity.ERROR,
-                                suggestion=f"Add a rule: '/{crit_prefix}* @security-team'",
-                            )
+                # Global wildcard '*' later shadows earlier rules unless under different sections
+                if p2 == "*" and rule1.section == rule2.section:
+                    self.diagnostics.append(
+                        Diagnostic(
+                            code="W002",
+                            message=(
+                                f"Rule '{p1}' on line {rule1.line_number} is shadowed by "
+                                f"catch-all '*' on line {rule2.line_number}."
+                            ),
+                            severity=DiagnosticSeverity.WARNING,
+                            line_number=rule1.line_number,
+                            suggestion="Place catch-all '*' rules at the very top of the file.",
+                            rule_line=rule1.raw,
                         )
-                        break  # Report once per critical path prefix
+                    )
+                    break
 
-        return report
+    def check_orphan_patterns(self, repo_files: List[str]) -> None:
+        """Flags rules whose patterns match zero files in the repository."""
+        if not repo_files:
+            return
+
+        for line in self.lines:
+            if line.line_type != LineType.RULE or not line.pattern:
+                continue
+
+            try:
+                regex = compile_pattern_to_regex(line.pattern)
+            except Exception:
+                continue
+
+            matched_any = any(regex.match(f) for f in repo_files)
+            if not matched_any:
+                self.diagnostics.append(
+                    Diagnostic(
+                        code="W003",
+                        message=f"Orphan pattern '{line.pattern}' matches 0 files in repository.",
+                        severity=DiagnosticSeverity.WARNING,
+                        line_number=line.line_number,
+                        suggestion="Update pattern to match existing files or delete if no longer needed.",
+                        rule_line=line.raw,
+                    )
+                )
+
+    def check_unowned_files(self, repo_files: List[str]) -> None:
+        """Flags repository files that have no matching CODEOWNERS rule."""
+        matcher = CodeOwnersMatcher(self.lines)
+        unowned_count = 0
+        examples: List[str] = []
+
+        for f in repo_files:
+            res = matcher.match_file(f)
+            if not res.matched:
+                unowned_count += 1
+                if len(examples) < 5:
+                    examples.append(f)
+
+        if unowned_count > 0:
+            sample_str = ", ".join(examples)
+            if unowned_count > 5:
+                sample_str += f", and {unowned_count - 5} more..."
+            self.diagnostics.append(
+                Diagnostic(
+                    code="W004",
+                    message=f"Found {unowned_count} unowned file(s) without CODEOWNERS coverage: {sample_str}",
+                    severity=DiagnosticSeverity.WARNING,
+                    suggestion="Add a catch-all '*' rule or specific rules covering these files.",
+                )
+            )

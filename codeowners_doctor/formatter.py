@@ -1,91 +1,85 @@
-"""Formatter and auto-fixer for CODEOWNERS files."""
-
+"""Formatter for CODEOWNERS files."""
 from __future__ import annotations
-from typing import List, Optional, Set, Tuple
-from .parser import CodeownersRule, ParsedCodeowners, parse_codeowners
-from .matcher import pattern_to_regex
+
+from typing import List, Tuple
+
+from codeowners_doctor.models import CodeOwnersLine, LineType
+from codeowners_doctor.parser import CodeOwnersParser
 
 
-def format_codeowners(
-    content: str,
-    sort_rules: bool = False,
-    align_columns: bool = True,
-    dedup_owners: bool = True,
-    repo_files: Optional[List[str]] = None,
-    remove_dead: bool = False,
-) -> str:
-    """Format and auto-clean a CODEOWNERS file content.
-    
-    - Aligns owner tokens into neat columns.
-    - Strips trailing whitespace.
-    - Deduplicates identical owners per rule.
-    - Optionally sorts rules within sections.
-    - Optionally removes dead patterns if repo_files is provided.
-    """
-    lines = content.splitlines()
-    if not lines:
-        return ""
+class CodeOwnersFormatter:
+    """Formats CODEOWNERS files with consistent alignment, deduplication, and spacing."""
 
-    parsed = parse_codeowners(content)
+    @staticmethod
+    def deduplicate_owners(owners: List[str]) -> List[str]:
+        """Removes duplicate owners preserving original order."""
+        seen = set()
+        deduped = []
+        for o in owners:
+            norm = o.lower()
+            if norm not in seen:
+                seen.add(norm)
+                deduped.append(o)
+        return deduped
 
-    # Filter out dead rules if requested
-    dead_line_numbers: Set[int] = set()
-    if remove_dead and repo_files is not None:
-        for rule in parsed.rules:
-            reg = pattern_to_regex(rule.pattern)
-            if not any(reg.match(f) for f in repo_files):
-                dead_line_numbers.add(rule.line_number)
+    @classmethod
+    def format_lines(cls, lines: List[CodeOwnersLine], min_column: int = 28) -> str:
+        """Formats parsed lines into a clean, aligned CODEOWNERS string."""
+        # Calculate maximum pattern width
+        max_pattern_len = 0
+        for line in lines:
+            if line.line_type == LineType.RULE and line.pattern:
+                if len(line.pattern) > max_pattern_len:
+                    max_pattern_len = len(line.pattern)
 
-    # Calculate max pattern width for alignment
-    max_pattern_len = 0
-    if align_columns and parsed.rules:
-        for r in parsed.rules:
-            if r.line_number not in dead_line_numbers:
-                max_pattern_len = max(max_pattern_len, len(r.pattern))
-        max_pattern_len = min(max_pattern_len + 4, 48)  # Reasonable column width
+        col_width = max(max_pattern_len + 4, min_column)
 
-    # Reconstruct lines
-    rule_by_line = {r.line_number: r for r in parsed.rules}
-    output_lines: List[str] = []
+        formatted_lines: List[str] = []
+        prev_empty = False
 
-    for idx, raw_line in enumerate(lines, start=1):
-        if idx in dead_line_numbers:
-            continue
+        for line in lines:
+            if line.line_type == LineType.EMPTY:
+                if not prev_empty:
+                    formatted_lines.append("")
+                    prev_empty = True
+                continue
 
-        if idx in rule_by_line:
-            rule = rule_by_line[idx]
+            prev_empty = False
 
-            # Format owners
-            owners_list: List[str] = []
-            seen_owners: Set[str] = set()
-            for o in rule.owners:
-                if dedup_owners:
-                    if o not in seen_owners:
-                        seen_owners.add(o)
-                        owners_list.append(o)
+            if line.line_type == LineType.COMMENT:
+                formatted_lines.append(f"# {line.comment}" if line.comment else "#")
+                continue
+
+            if line.line_type == LineType.SECTION:
+                formatted_lines.append(f"[{line.section}]")
+                continue
+
+            if line.line_type == LineType.RULE and line.pattern:
+                deduped_owners = cls.deduplicate_owners(line.owners)
+                owners_str = " ".join(deduped_owners)
+
+                if owners_str:
+                    rule_str = f"{line.pattern:<{col_width}} {owners_str}"
                 else:
-                    owners_list.append(o)
+                    rule_str = line.pattern
 
-            pattern = rule.pattern.replace("\\", "/")
-            owners_str = " ".join(owners_list)
+                if line.comment:
+                    rule_str = f"{rule_str}  # {line.comment}"
 
-            if align_columns and max_pattern_len > 0:
-                padded_pattern = pattern.ljust(max_pattern_len)
-            else:
-                padded_pattern = f"{pattern} "
+                formatted_lines.append(rule_str.rstrip())
 
-            if owners_str:
-                formatted_line = f"{padded_pattern} {owners_str}"
-            else:
-                formatted_line = pattern
+        # Ensure trailing newline
+        return "\n".join(formatted_lines).rstrip() + "\n"
 
-            if rule.comment:
-                formatted_line = f"{formatted_line}  # {rule.comment}"
+    @classmethod
+    def format_text(cls, text: str) -> str:
+        """Parses text and formats it."""
+        lines = CodeOwnersParser.parse_text(text)
+        return cls.format_lines(lines)
 
-            output_lines.append(formatted_line.rstrip())
-        else:
-            # Comment or section or empty line
-            output_lines.append(raw_line.rstrip())
-
-    # Final newline guarantee
-    return "\n".join(output_lines) + "\n"
+    @classmethod
+    def check_text(cls, text: str) -> Tuple[bool, str]:
+        """Returns True if text is already formatted, plus the formatted string."""
+        formatted = cls.format_text(text)
+        is_formatted = text.strip() == formatted.strip()
+        return is_formatted, formatted

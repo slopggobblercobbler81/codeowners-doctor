@@ -1,6 +1,6 @@
-"""Command Line Interface for codeowners-doctor."""
-
+"""Command line interface for codeowners-doctor."""
 from __future__ import annotations
+
 import argparse
 import json
 import os
@@ -8,300 +8,345 @@ import sys
 from pathlib import Path
 from typing import List, Optional
 
-from . import __version__
-from .parser import parse_codeowners
-from .matcher import CodeownersMatcher
-from .linter import CodeownersLinter, IssueSeverity
-from .formatter import format_codeowners
-from .audit import audit_ownership
-from .generator import generate_codeowners
+from codeowners_doctor import __version__
+from codeowners_doctor.formatter import CodeOwnersFormatter
+from codeowners_doctor.linter import CodeOwnersLinter, get_repository_files
+from codeowners_doctor.matcher import CodeOwnersMatcher
+from codeowners_doctor.models import DiagnosticSeverity
+from codeowners_doctor.parser import CodeOwnersParser
 
 
-POSSIBLE_CODEOWNERS_PATHS = [
-    ".github/CODEOWNERS",
-    "CODEOWNERS",
-    "docs/CODEOWNERS",
-    ".gitlab/CODEOWNERS",
-]
+# ANSI Colors with NO_COLOR and TTY check
+def _use_color() -> bool:
+    if os.environ.get("NO_COLOR"):
+        return False
+    if not sys.stdout.isatty():
+        return False
+    return True
 
 
-def find_codeowners_file(start_dir: Optional[Path] = None) -> Optional[Path]:
-    """Auto-detect CODEOWNERS file location in standard directories."""
-    base = start_dir or Path.cwd()
-    for rel in POSSIBLE_CODEOWNERS_PATHS:
-        candidate = base / rel
-        if candidate.is_file():
-            return candidate
+def _c(text: str, code: str) -> str:
+    if not _use_color():
+        return text
+    return f"\033[{code}m{text}\033[0m"
+
+
+def red(text: str) -> str:
+    return _c(text, "31;1")
+
+
+def yellow(text: str) -> str:
+    return _c(text, "33")
+
+
+def green(text: str) -> str:
+    return _c(text, "32;1")
+
+
+def cyan(text: str) -> str:
+    return _c(text, "36")
+
+
+def bold(text: str) -> str:
+    return _c(text, "1")
+
+
+def dim(text: str) -> str:
+    return _c(text, "2")
+
+
+def _safe_symbol(char: str, fallback: str) -> str:
+    try:
+        char.encode(getattr(sys.stdout, "encoding", "utf-8") or "utf-8")
+        return char
+    except Exception:
+        return fallback
+
+
+CHECK_MARK = _safe_symbol("✓", "[OK]")
+CROSS_MARK = _safe_symbol("✗", "[X]")
+ARROW_MARK = _safe_symbol("↳", "->")
+
+
+def resolve_codeowners_file(path_arg: Optional[str] = None, repo_root: Optional[Path] = None) -> Optional[Path]:
+    """Finds the targeted CODEOWNERS file from arguments or discovery."""
+    if path_arg:
+        p = Path(path_arg)
+        if p.is_file():
+            return p.resolve()
+        elif p.is_dir():
+            candidates = CodeOwnersParser.discover_codeowners(p)
+            if candidates:
+                return candidates[0].resolve()
+            return None
+
+    root = repo_root or Path.cwd()
+    candidates = CodeOwnersParser.discover_codeowners(root)
+    if candidates:
+        return candidates[0].resolve()
+
     return None
 
 
-def _print_colored(text: str, color: str = "") -> None:
-    colors = {
-        "red": "\033[91m",
-        "green": "\033[92m",
-        "yellow": "\033[93m",
-        "blue": "\033[94m",
-        "bold": "\033[1m",
-        "reset": "\033[0m",
-    }
-    # Safely print with fallback for Windows non-UTF8 consoles
-    try:
-        if sys.stdout.isatty():
-            sys.stdout.write(f"{colors.get(color, '')}{text}{colors['reset']}\n")
-        else:
-            sys.stdout.write(f"{text}\n")
-    except UnicodeEncodeError:
-        encoding = sys.stdout.encoding or "ascii"
-        fallback = text.encode(encoding, errors="replace").decode(encoding)
-        sys.stdout.write(f"{fallback}\n")
-
-
 def cmd_check(args: argparse.Namespace) -> int:
-    """Execute 'check' linter command."""
-    target_file = Path(args.file) if args.file else find_codeowners_file()
-    if not target_file or not target_file.is_file():
-        sys.stderr.write(
-            f"Error: Could not locate CODEOWNERS file. Specify path with --file or run inside a git repository.\n"
-        )
-        return 1
+    """Runs linting and validation on CODEOWNERS."""
+    repo_root = Path(args.root).resolve() if args.root else Path.cwd().resolve()
+    codeowners_path = resolve_codeowners_file(args.path, repo_root)
 
-    content = target_file.read_text(encoding="utf-8")
-    repo_dir = Path(args.repo) if args.repo else target_file.parent.parent
-
-    linter = CodeownersLinter(
-        repo_dir=repo_dir if repo_dir.is_dir() else None,
-        check_dead_rules=not args.no_dead_rules,
-        check_critical_paths=not args.no_critical_check,
-    )
-    report = linter.lint(content)
-
-    if args.json:
-        print(json.dumps(report.to_dict(), indent=2))
-    elif args.sarif:
-        print(json.dumps(report.to_sarif(), indent=2))
-    else:
-        print(f"Scanning CODEOWNERS file: {target_file}")
-        print(f"Found {report.total_rules} rules across {report.total_lines} lines.\n")
-
-        if report.is_clean:
-            _print_colored("[OK] No issues found! CODEOWNERS is healthy.", "green")
+    if not codeowners_path or not codeowners_path.is_file():
+        if args.format == "json":
+            print(json.dumps({"error": "No CODEOWNERS file found", "diagnostics": []}, indent=2))
         else:
-            for issue in report.issues:
-                prefix = {
-                    IssueSeverity.ERROR: "[ERROR]",
-                    IssueSeverity.WARNING: "[WARN ]",
-                    IssueSeverity.INFO: "[INFO ]",
-                }[issue.severity]
+            print(red("Error: No CODEOWNERS file found."), file=sys.stderr)
+            print("Checked locations: .github/CODEOWNERS, CODEOWNERS, docs/CODEOWNERS", file=sys.stderr)
+        return 2
 
-                color = {
-                    IssueSeverity.ERROR: "red",
-                    IssueSeverity.WARNING: "yellow",
-                    IssueSeverity.INFO: "blue",
-                }[issue.severity]
+    # Discover candidate files in repo if repo_root wasn't specified but file is inside repo
+    if not args.root:
+        # If codeowners is in .github/CODEOWNERS, parent of .github is root
+        parent = codeowners_path.parent
+        if parent.name in (".github", "docs", ".gitlab"):
+            repo_root = parent.parent
+        else:
+            repo_root = parent
 
-                loc = f"Line {issue.line_number}: " if issue.line_number else ""
-                _print_colored(f"{prefix} {loc}{issue.message}", color)
-                if issue.suggestion:
-                    print(f"       Suggestion: {issue.suggestion}")
+    lines = CodeOwnersParser.parse_file(codeowners_path)
+    linter = CodeOwnersLinter(lines, repo_root=repo_root, codeowners_path=codeowners_path)
+    diagnostics = linter.run_all(check_unowned=args.unowned)
 
-            print(
-                f"\nSummary: {len(report.errors)} error(s), {len(report.warnings)} warning(s), {len(report.infos)} info."
+    # Check for multiple codeowners files
+    all_codeowners = CodeOwnersParser.discover_codeowners(repo_root)
+    if len(all_codeowners) > 1 and not args.path:
+        from codeowners_doctor.models import Diagnostic
+        other_files = [p.relative_to(repo_root).as_posix() for p in all_codeowners[1:]]
+        diagnostics.append(
+            Diagnostic(
+                code="W006",
+                message=(
+                    f"Multiple CODEOWNERS files found. '{all_codeowners[0].relative_to(repo_root).as_posix()}' "
+                    f"takes precedence. Ignored: {', '.join(other_files)}"
+                ),
+                severity=DiagnosticSeverity.WARNING,
+                suggestion="Consolidate code owners into a single file.",
             )
+        )
 
-    if report.has_errors:
+    has_errors = any(d.severity == DiagnosticSeverity.ERROR for d in diagnostics)
+    has_warnings = any(d.severity == DiagnosticSeverity.WARNING for d in diagnostics)
+
+    if args.format == "json":
+        output = {
+            "file": str(codeowners_path),
+            "root": str(repo_root),
+            "rules_count": len([l for l in lines if l.line_type.value == "rule"]),
+            "diagnostics": [d.to_dict() for d in diagnostics],
+            "passed": not has_errors and not (has_warnings and args.strict),
+        }
+        print(json.dumps(output, indent=2))
+    else:
+        rel_codeowners = codeowners_path
+        try:
+            rel_codeowners = codeowners_path.relative_to(repo_root)
+        except ValueError:
+            pass
+
+        print(bold(f"CODEOWNERS Doctor: Checking {cyan(str(rel_codeowners))}"))
+        print(dim(f"Repository Root: {repo_root}\n"))
+
+        if not diagnostics:
+            print(green(f"{CHECK_MARK} All checks passed! No issues found."))
+        else:
+            for diag in diagnostics:
+                prefix = red("ERROR") if diag.severity == DiagnosticSeverity.ERROR else yellow("WARN ")
+                loc = f"line {diag.line_number}: " if diag.line_number else ""
+                print(f"[{prefix}] [{cyan(diag.code)}] {bold(loc)}{diag.message}")
+                if diag.rule_line:
+                    print(f"        {dim(diag.rule_line.strip())}")
+                if diag.suggestion:
+                    print(f"        {ARROW_MARK} {dim('Suggestion: ' + diag.suggestion)}")
+                print()
+
+            err_count = sum(1 for d in diagnostics if d.severity == DiagnosticSeverity.ERROR)
+            warn_count = sum(1 for d in diagnostics if d.severity == DiagnosticSeverity.WARNING)
+            print(f"Summary: {red(str(err_count))} error(s), {yellow(str(warn_count))} warning(s)")
+
+    if has_errors:
         return 1
-    if args.strict and len(report.warnings) > 0:
+    if has_warnings and args.strict:
         return 1
     return 0
 
 
 def cmd_who(args: argparse.Namespace) -> int:
-    """Execute 'who' query command."""
-    target_file = Path(args.file) if args.file else find_codeowners_file()
-    if not target_file or not target_file.is_file():
-        sys.stderr.write("Error: Could not locate CODEOWNERS file.\n")
-        return 1
+    """Finds which rule and code owners govern a given file path."""
+    repo_root = Path(args.root).resolve() if args.root else Path.cwd().resolve()
+    codeowners_path = resolve_codeowners_file(args.path, repo_root)
 
-    content = target_file.read_text(encoding="utf-8")
-    parsed = parse_codeowners(content)
-    matcher = CodeownersMatcher(parsed)
+    if not codeowners_path or not codeowners_path.is_file():
+        print(red("Error: No CODEOWNERS file found."), file=sys.stderr)
+        return 2
 
-    query_path = args.path
-    rule = matcher.find_matching_rule(query_path)
-
-    if args.json:
-        result = {
-            "path": query_path,
-            "owned": bool(rule and rule.owners),
-            "owners": list(rule.owners) if rule else [],
-            "matching_rule": {
-                "pattern": rule.pattern,
-                "line_number": rule.line_number,
-                "section": rule.section,
-            } if rule else None,
-        }
-        print(json.dumps(result, indent=2))
-    else:
-        if rule and rule.owners:
-            _print_colored(f"Path: {query_path}", "bold")
-            _print_colored(f"Owners: {', '.join(rule.owners)}", "green")
-            print(f"Matched Rule: '{rule.pattern}' (line {rule.line_number})")
-            if rule.section:
-                print(f"Section: {rule.section}")
-        elif rule and not rule.owners:
-            _print_colored(f"Path: {query_path}", "bold")
-            _print_colored("Explicitly unowned (owners cleared by rule)", "yellow")
-            print(f"Matched Rule: '{rule.pattern}' (line {rule.line_number})")
-        else:
-            _print_colored(f"Path: {query_path}", "bold")
-            _print_colored("Unowned (no matching rule)", "red")
-
-    return 0
-
-
-def cmd_audit(args: argparse.Namespace) -> int:
-    """Execute 'audit' coverage report command."""
-    target_file = Path(args.file) if args.file else find_codeowners_file()
-    if not target_file or not target_file.is_file():
-        sys.stderr.write("Error: Could not locate CODEOWNERS file.\n")
-        return 1
-
-    content = target_file.read_text(encoding="utf-8")
-    repo_dir = Path(args.repo) if args.repo else target_file.parent.parent
-
-    report = audit_ownership(content, repo_dir=repo_dir)
+    lines = CodeOwnersParser.parse_file(codeowners_path)
+    matcher = CodeOwnersMatcher(lines)
+    result = matcher.match_file(args.file)
 
     if args.format == "json":
-        print(json.dumps(report.to_dict(), indent=2))
-    elif args.format == "markdown":
-        print(report.to_markdown())
+        print(json.dumps(result.to_dict(), indent=2))
     else:
-        print(report.to_text())
+        if result.matched:
+            owners_str = ", ".join(result.owners) if result.owners else "None (unowned)"
+            sec_str = f" in section [{result.section}]" if result.section else ""
+            print(bold(f"File: {cyan(result.file_path)}"))
+            print(f"  Matched Rule: {green(result.pattern or '')}{sec_str} (line {result.rule_line_number})")
+            print(f"  Owners:       {bold(owners_str)}")
+        else:
+            print(yellow(f"File: {result.file_path}"))
+            print(red("  No CODEOWNERS rule matches this file (unowned)."))
 
-    if args.min_coverage is not None and report.coverage_percent < args.min_coverage:
-        sys.stderr.write(
-            f"\nCoverage check failed: {report.coverage_percent:.1f}% < minimum threshold {args.min_coverage}%\n"
-        )
-        return 1
+    return 0 if result.matched else 1
 
-    return 0
+
+def cmd_unowned(args: argparse.Namespace) -> int:
+    """Finds all files in repository that have no code owner assigned."""
+    repo_root = Path(args.root).resolve() if args.root else Path.cwd().resolve()
+    codeowners_path = resolve_codeowners_file(args.path, repo_root)
+
+    if not codeowners_path or not codeowners_path.is_file():
+        print(red("Error: No CODEOWNERS file found."), file=sys.stderr)
+        return 2
+
+    lines = CodeOwnersParser.parse_file(codeowners_path)
+    matcher = CodeOwnersMatcher(lines)
+    files = get_repository_files(repo_root)
+
+    unowned: List[str] = []
+    for f in files:
+        res = matcher.match_file(f)
+        if not res.matched:
+            unowned.append(f)
+
+    if args.format == "json":
+        output = {
+            "total_files": len(files),
+            "unowned_count": len(unowned),
+            "unowned_files": unowned,
+        }
+        print(json.dumps(output, indent=2))
+    else:
+        print(bold(f"Checking unowned files in {cyan(str(repo_root))}..."))
+        print(f"Total files analyzed: {len(files)}")
+        if not unowned:
+            print(green(f"{CHECK_MARK} 100% code ownership coverage! No unowned files."))
+        else:
+            print(yellow(f"Found {len(unowned)} unowned file(s):"))
+            for u in unowned:
+                print(f"  - {u}")
+
+    return 1 if unowned else 0
 
 
 def cmd_format(args: argparse.Namespace) -> int:
-    """Execute 'format' or 'fix' command."""
-    target_file = Path(args.file) if args.file else find_codeowners_file()
-    if not target_file or not target_file.is_file():
-        sys.stderr.write("Error: Could not locate CODEOWNERS file.\n")
-        return 1
+    """Formats a CODEOWNERS file."""
+    repo_root = Path(args.root).resolve() if args.root else Path.cwd().resolve()
+    codeowners_path = resolve_codeowners_file(args.path, repo_root)
 
-    content = target_file.read_text(encoding="utf-8")
-    repo_dir = Path(args.repo) if args.repo else target_file.parent.parent
+    if not codeowners_path or not codeowners_path.is_file():
+        print(red("Error: No CODEOWNERS file found."), file=sys.stderr)
+        return 2
 
-    repo_files: Optional[List[str]] = None
-    if args.remove_dead and repo_dir.is_dir():
-        from .linter import CodeownersLinter
-        repo_files = CodeownersLinter(repo_dir=repo_dir)._discover_repo_files()
+    content = codeowners_path.read_text(encoding="utf-8")
+    is_formatted, formatted = CodeOwnersFormatter.check_text(content)
 
-    formatted = format_codeowners(
-        content=content,
-        align_columns=not args.no_align,
-        dedup_owners=True,
-        repo_files=repo_files,
-        remove_dead=args.remove_dead,
-    )
+    if args.check:
+        if is_formatted:
+            print(green(f"{CHECK_MARK} {codeowners_path.name} is properly formatted."))
+            return 0
+        else:
+            print(yellow(f"{CROSS_MARK} {codeowners_path.name} is not formatted."))
+            return 1
 
-    if args.in_place:
-        target_file.write_text(formatted, encoding="utf-8")
-        _print_colored(f"Formatted and saved: {target_file}", "green")
-    elif args.output:
-        Path(args.output).write_text(formatted, encoding="utf-8")
-        _print_colored(f"Formatted and saved to: {args.output}", "green")
+    if args.write:
+        if not is_formatted:
+            codeowners_path.write_text(formatted, encoding="utf-8")
+            print(green(f"{CHECK_MARK} Formatted and updated {codeowners_path}."))
+        else:
+            print(dim(f"{codeowners_path.name} already well-formatted. No changes."))
+        return 0
+
+    # Default to stdout
+    print(formatted, end="")
+    return 0
+
+
+def cmd_locate(args: argparse.Namespace) -> int:
+    """Locates CODEOWNERS files in the repository and displays priority order."""
+    repo_root = Path(args.root).resolve() if args.root else Path.cwd().resolve()
+    found = CodeOwnersParser.discover_codeowners(repo_root)
+
+    if args.format == "json":
+        output = {
+            "root": str(repo_root),
+            "found": [str(p) for p in found],
+            "active": str(found[0]) if found else None,
+        }
+        print(json.dumps(output, indent=2))
     else:
-        sys.stdout.write(formatted)
+        print(bold(f"CODEOWNERS Discovery for {cyan(str(repo_root))}:"))
+        if not found:
+            print(yellow("No CODEOWNERS file found in standard locations."))
+            print("Standard locations: .github/CODEOWNERS, CODEOWNERS, docs/CODEOWNERS")
+        else:
+            print(green(f"Active: {found[0].relative_to(repo_root).as_posix()}"))
+            if len(found) > 1:
+                print(yellow("Ignored duplicates (lower priority):"))
+                for p in found[1:]:
+                    print(f"  - {p.relative_to(repo_root).as_posix()}")
 
-    return 0
-
-
-def cmd_init(args: argparse.Namespace) -> int:
-    """Execute 'init' template generator command."""
-    out_path = Path(args.out) if args.out else Path(".github/CODEOWNERS")
-    if out_path.exists() and not args.force:
-        sys.stderr.write(f"Error: Destination {out_path} already exists. Use --force to overwrite.\n")
-        return 1
-
-    generated = generate_codeowners(
-        default_owner=args.default_owner,
-        sec_owner=args.security_owner,
-        ops_owner=args.ops_owner,
-        docs_owner=args.docs_owner,
-        repo_dir=Path.cwd(),
-    )
-
-    out_path.parent.mkdir(parents=True, exist_ok=True)
-    out_path.write_text(generated, encoding="utf-8")
-    _print_colored(f"Successfully generated starter CODEOWNERS at {out_path}", "green")
-    return 0
+    return 0 if found else 1
 
 
 def build_parser() -> argparse.ArgumentParser:
-    """Build CLI argument parser."""
+    """Constructs the command-line argument parser."""
     parser = argparse.ArgumentParser(
         prog="codeowners-doctor",
-        description="Production-grade CODEOWNERS validator, ownership auditor, linter, and formatter.",
+        description="Production-grade CODEOWNERS validator, linter, analyzer, and formatter.",
     )
-    parser.add_argument("--version", action="version", version=f"codeowners-doctor {__version__}")
+    parser.add_argument("-v", "--version", action="version", version=f"%(prog)s {__version__}")
 
-    subparsers = parser.add_subparsers(dest="command", help="Command to execute")
+    subparsers = parser.add_subparsers(dest="command", help="Available subcommands")
 
-    # check command
-    p_check = subparsers.add_parser("check", help="Lint and validate CODEOWNERS file (default)")
-    p_check.add_argument("file", nargs="?", help="Path to CODEOWNERS file (auto-detected if omitted)")
-    p_check.add_argument("--repo", help="Path to repository root")
-    p_check.add_argument("--strict", action="store_true", help="Fail with exit 1 on warnings")
-    p_check.add_argument("--no-dead-rules", action="store_true", help="Skip dead rule checks against repo files")
-    p_check.add_argument("--no-critical-check", action="store_true", help="Skip critical security paths check")
-    p_check.add_argument("--json", action="store_true", help="Output results as JSON")
-    p_check.add_argument("--sarif", action="store_true", help="Output results as SARIF for GitHub Code Scanning")
+    # check
+    p_check = subparsers.add_parser("check", help="Lint and validate CODEOWNERS rules")
+    p_check.add_argument("path", nargs="?", help="Path to CODEOWNERS file or repository")
+    p_check.add_argument("-r", "--root", help="Repository root directory")
+    p_check.add_argument("-s", "--strict", action="store_true", help="Fail with exit 1 on warnings")
+    p_check.add_argument("-u", "--unowned", action="store_true", help="Also check for unowned files")
+    p_check.add_argument("-f", "--format", choices=["text", "json"], default="text", help="Output format")
 
-    # who command
-    p_who = subparsers.add_parser("who", help="Query which owner(s) are responsible for a file path")
-    p_who.add_argument("path", help="Relative file or directory path to query")
-    p_who.add_argument("--file", help="Path to CODEOWNERS file")
-    p_who.add_argument("--json", action="store_true", help="Output as JSON")
+    # who
+    p_who = subparsers.add_parser("who", help="Identify code owners for a specific file")
+    p_who.add_argument("file", help="File path to test ownership for")
+    p_who.add_argument("-p", "--path", help="Path to CODEOWNERS file")
+    p_who.add_argument("-r", "--root", help="Repository root directory")
+    p_who.add_argument("-f", "--format", choices=["text", "json"], default="text", help="Output format")
 
-    # audit command
-    p_audit = subparsers.add_parser("audit", help="Audit ownership coverage across repository files")
-    p_audit.add_argument("--file", help="Path to CODEOWNERS file")
-    p_audit.add_argument("--repo", help="Path to repository root")
-    p_audit.add_argument("--format", choices=["text", "markdown", "json"], default="text", help="Output format")
-    p_audit.add_argument("--min-coverage", type=float, help="Fail if coverage percentage is below threshold")
+    # unowned
+    p_unowned = subparsers.add_parser("unowned", help="List all unowned files in repository")
+    p_unowned.add_argument("-p", "--path", help="Path to CODEOWNERS file")
+    p_unowned.add_argument("-r", "--root", help="Repository root directory")
+    p_unowned.add_argument("-f", "--format", choices=["text", "json"], default="text", help="Output format")
 
-    # format / fix command
-    p_fmt = subparsers.add_parser("format", help="Reformat and tidy CODEOWNERS file")
-    p_fmt.add_argument("--file", help="Path to CODEOWNERS file")
-    p_fmt.add_argument("--repo", help="Path to repository root")
-    p_fmt.add_argument("-i", "--in-place", action="store_true", help="Modify file in-place")
-    p_fmt.add_argument("-o", "--output", help="Write formatted output to specified file")
-    p_fmt.add_argument("--no-align", action="store_true", help="Disable column alignment")
-    p_fmt.add_argument("--remove-dead", action="store_true", help="Strip patterns that match 0 files in repo")
+    # format
+    p_fmt = subparsers.add_parser("format", help="Format CODEOWNERS file alignment and clean duplicates")
+    p_fmt.add_argument("path", nargs="?", help="Path to CODEOWNERS file")
+    p_fmt.add_argument("-r", "--root", help="Repository root directory")
+    p_fmt.add_argument("-w", "--write", action="store_true", help="Format in place")
+    p_fmt.add_argument("-c", "--check", action="store_true", help="Check formatting without writing")
 
-    # alias fix -> format
-    p_fix = subparsers.add_parser("fix", help="Alias for 'format --remove-dead -i'")
-    p_fix.add_argument("--file", help="Path to CODEOWNERS file")
-    p_fix.add_argument("--repo", help="Path to repository root")
-    p_fix.add_argument("-i", "--in-place", action="store_true", default=True, help="Modify file in-place (default)")
-    p_fix.add_argument("-o", "--output", help="Write formatted output to specified file")
-    p_fix.add_argument("--no-align", action="store_true", help="Disable column alignment")
-    p_fix.add_argument("--remove-dead", action="store_true", default=True, help="Strip patterns that match 0 files")
-
-    # init command
-    p_init = subparsers.add_parser("init", help="Generate production starter CODEOWNERS file")
-    p_init.add_argument("--out", help="Output path (default: .github/CODEOWNERS)")
-    p_init.add_argument("--default-owner", default="@org/maintainers", help="Default owner for wildcard rule")
-    p_init.add_argument("--security-owner", help="Owner for security policies")
-    p_init.add_argument("--ops-owner", help="Owner for CI/CD and infra")
-    p_init.add_argument("--docs-owner", help="Owner for documentation")
-    p_init.add_argument("-f", "--force", action="store_true", help="Overwrite if destination exists")
+    # locate
+    p_locate = subparsers.add_parser("locate", help="Locate CODEOWNERS files and show precedence")
+    p_locate.add_argument("-r", "--root", help="Repository root directory")
+    p_locate.add_argument("-f", "--format", choices=["text", "json"], default="text", help="Output format")
 
     return parser
 
@@ -310,22 +355,27 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser = build_parser()
     args = parser.parse_args(argv)
 
-    if not args.command or args.command == "check":
-        if not args.command:
-            # Default to check command
-            args = parser.parse_args(["check"] + (argv or []))
+    if not args.command:
+        # Default behavior: run check
+        args.command = "check"
+        args.path = None
+        args.root = None
+        args.strict = False
+        args.unowned = False
+        args.format = "text"
+
+    if args.command == "check":
         return cmd_check(args)
     elif args.command == "who":
         return cmd_who(args)
-    elif args.command == "audit":
-        return cmd_audit(args)
-    elif args.command in ("format", "fix"):
+    elif args.command == "unowned":
+        return cmd_unowned(args)
+    elif args.command == "format":
         return cmd_format(args)
-    elif args.command == "init":
-        return cmd_init(args)
+    elif args.command == "locate":
+        return cmd_locate(args)
 
-    parser.print_help()
-    return 1
+    return 0
 
 
 if __name__ == "__main__":

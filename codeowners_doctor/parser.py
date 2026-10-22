@@ -1,220 +1,167 @@
-"""Parser for GitHub and GitLab CODEOWNERS files."""
-
+"""Parser for CODEOWNERS files."""
 from __future__ import annotations
+
 import re
-from dataclasses import dataclass, field
+from pathlib import Path
 from typing import List, Optional, Tuple
 
-
-EMAIL_REGEX = re.compile(
-    r"^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\.[a-zA-Z0-9-.]+$"
-)
-USERNAME_REGEX = re.compile(
-    r"^@[a-zA-Z0-9](?:[a-zA-Z0-9]|-(?=[a-zA-Z0-9])){0,38}$"
-)
-TEAM_REGEX = re.compile(
-    r"^@[a-zA-Z0-9](?:[a-zA-Z0-9]|-(?=[a-zA-Z0-9])){0,38}/[a-zA-Z0-9._-]+$"
-)
-SECTION_REGEX = re.compile(
-    r"^(\^)?\[(?P<name>[^\]]+)\](?:\[(?P<approvals>\d+)\])?(?:\s+(?P<owners>.*))?$"
-)
+from codeowners_doctor.models import CodeOwnersLine, LineType
 
 
-@dataclass(frozen=True)
-class CodeownersRule:
-    """Represents a single pattern-to-owners assignment rule."""
-    pattern: str
-    owners: Tuple[str, ...]
-    line_number: int
-    raw_line: str
-    comment: Optional[str] = None
-    section: Optional[str] = None
-
-    @property
-    def is_unowned(self) -> bool:
-        """True if the rule explicitly clears ownership for the pattern."""
-        return len(self.owners) == 0
+SECTION_RE = re.compile(r"^(\^)?\[([^\]]+)\](?:\[(\d+)\])?\s*(?:#.*)?$")
 
 
-@dataclass
-class CodeownersSection:
-    """Represents a GitLab-style section header."""
-    name: str
-    line_number: int
-    default_owners: Tuple[str, ...] = field(default_factory=tuple)
-    optional: bool = False
-    approvals_required: Optional[int] = None
-
-
-@dataclass
-class ParsedCodeowners:
-    """The complete result of parsing a CODEOWNERS file."""
-    rules: List[CodeownersRule]
-    sections: List[CodeownersSection]
-    raw_lines: List[str]
-    comments: List[Tuple[int, str]]  # (line_number, comment_text)
-
-
-def is_valid_owner(owner: str) -> bool:
-    """Check if an owner string is a valid GitHub user, team, or email."""
-    if not owner:
-        return False
-    if owner.startswith("@"):
-        if "/" in owner:
-            return bool(TEAM_REGEX.match(owner))
-        return bool(USERNAME_REGEX.match(owner))
-    return bool(EMAIL_REGEX.match(owner))
-
-
-def _tokenize_line(line: str) -> Tuple[str, List[str], Optional[str]]:
-    """Tokenize a CODEOWNERS line into (pattern, owners, trailing_comment).
+def split_codeowners_line(line: str) -> Tuple[Optional[str], List[str], Optional[str]]:
+    """Splits a CODEOWNERS rule line into pattern, owners, and inline comment.
     
-    Handles escaped spaces (\\ ) and escaped hashes (\\#).
+    Handles escaped spaces in pattern (e.g. `path/to/my\\ file.txt`).
     """
-    pattern_chars: List[str] = []
+    stripped = line.strip()
+    if not stripped:
+        return None, [], None
+
+    # Check for whole-line comment
+    if stripped.startswith("#"):
+        return None, [], stripped[1:].strip()
+
+    # Tokenize preserving escaped spaces
+    tokens: List[str] = []
+    current: List[str] = []
+    escaped = False
+    comment_part: Optional[str] = None
+
     i = 0
-    n = len(line)
+    while i < len(line):
+        ch = line[i]
 
-    # Skip leading whitespace
-    while i < n and line[i].isspace():
-        i += 1
-
-    if i >= n or line[i] == "#":
-        return "", [], None
-
-    # Parse pattern
-    in_escape = False
-    while i < n:
-        c = line[i]
-        if in_escape:
-            pattern_chars.append(c)
-            in_escape = False
+        if escaped:
+            current.append(ch)
+            escaped = False
             i += 1
             continue
 
-        if c == "\\":
-            in_escape = True
+        if ch == "\\":
+            escaped = True
+            current.append(ch)
             i += 1
             continue
 
-        if c.isspace():
-            break
-        pattern_chars.append(c)
-        i += 1
-
-    pattern = "".join(pattern_chars)
-
-    # Parse owners and optional trailing comment
-    owners: List[str] = []
-    trailing_comment: Optional[str] = None
-
-    while i < n:
-        # Skip whitespace
-        while i < n and line[i].isspace():
-            i += 1
-        if i >= n:
-            break
-
-        if line[i] == "#":
-            # Trailing comment begins
-            trailing_comment = line[i + 1:].strip()
-            break
-
-        # Collect owner token
-        owner_chars: List[str] = []
-        while i < n and not line[i].isspace():
-            if line[i] == "#":
+        if ch == "#":
+            # If we are starting a token or following whitespace, it's a comment
+            if not current or line[i - 1].isspace():
+                comment_part = line[i + 1 :].strip()
                 break
-            owner_chars.append(line[i])
-            i += 1
 
-        token = "".join(owner_chars).strip()
-        if token:
-            owners.append(token)
+        if ch.isspace():
+            if current:
+                token = "".join(current)
+                tokens.append(token)
+                current = []
+        else:
+            current.append(ch)
 
-    return pattern, owners, trailing_comment
+        i += 1
+
+    if current:
+        tokens.append("".join(current))
+
+    if not tokens:
+        return None, [], comment_part
+
+    pattern = tokens[0]
+    owners = tokens[1:]
+    return pattern, owners, comment_part
 
 
-class CodeownersParser:
-    """Production parser for CODEOWNERS files."""
+class CodeOwnersParser:
+    """Parses CODEOWNERS file into structured lines."""
 
-    def __init__(self) -> None:
-        pass
+    STANDARD_LOCATIONS = [
+        ".github/CODEOWNERS",
+        "CODEOWNERS",
+        "docs/CODEOWNERS",
+        ".gitlab/CODEOWNERS",
+    ]
 
-    def parse(self, content: str) -> ParsedCodeowners:
-        """Parse raw text content of a CODEOWNERS file."""
+    @classmethod
+    def discover_codeowners(cls, repo_root: Path) -> List[Path]:
+        """Discovers all candidate CODEOWNERS files in priority order."""
+        found = []
+        for loc in cls.STANDARD_LOCATIONS:
+            path = repo_root / loc
+            if path.is_file():
+                found.append(path)
+        return found
+
+    @classmethod
+    def parse_text(cls, content: str) -> List[CodeOwnersLine]:
+        """Parses the text content of a CODEOWNERS file."""
         lines = content.splitlines()
-        rules: List[CodeownersRule] = []
-        sections: List[CodeownersSection] = []
-        comments: List[Tuple[int, str]] = []
-
+        parsed: List[CodeOwnersLine] = []
         current_section: Optional[str] = None
-        current_section_owners: Tuple[str, ...] = ()
 
-        for idx, line in enumerate(lines, start=1):
-            stripped = line.strip()
+        for line_num, raw in enumerate(lines, start=1):
+            stripped = raw.strip()
 
+            # Empty line
             if not stripped:
-                continue
-
-            if stripped.startswith("#"):
-                comments.append((idx, stripped[1:].strip()))
-                continue
-
-            # Check if this is a GitLab section header
-            section_match = SECTION_REGEX.match(stripped)
-            if section_match:
-                is_optional = bool(section_match.group(1))
-                sec_name = section_match.group("name").strip()
-                approvals_str = section_match.group("approvals")
-                approvals = int(approvals_str) if approvals_str else None
-                owners_raw = section_match.group("owners")
-                sec_owners: List[str] = []
-                if owners_raw:
-                    for o in owners_raw.split():
-                        o = o.strip()
-                        if o and not o.startswith("#"):
-                            sec_owners.append(o)
-
-                current_section = sec_name
-                current_section_owners = tuple(sec_owners)
-                sections.append(
-                    CodeownersSection(
-                        name=sec_name,
-                        line_number=idx,
-                        default_owners=current_section_owners,
-                        optional=is_optional,
-                        approvals_required=approvals,
+                parsed.append(
+                    CodeOwnersLine(
+                        line_number=line_num,
+                        raw=raw,
+                        line_type=LineType.EMPTY,
+                        section=current_section,
                     )
                 )
                 continue
 
-            pattern, owners, trailing_comment = _tokenize_line(line)
-            if not pattern:
+            # Full line comment
+            if stripped.startswith("#"):
+                comment_body = stripped[1:].strip()
+                parsed.append(
+                    CodeOwnersLine(
+                        line_number=line_num,
+                        raw=raw,
+                        line_type=LineType.COMMENT,
+                        comment=comment_body,
+                        section=current_section,
+                    )
+                )
                 continue
 
-            # If rule has no explicit owners but section has default owners, assign section owners
-            final_owners = tuple(owners) if owners else current_section_owners
+            # GitLab Section header: [Section Name] or ^[Section Name] or [Section][2]
+            sec_match = SECTION_RE.match(stripped)
+            if sec_match:
+                section_name = sec_match.group(2).strip()
+                current_section = section_name
+                parsed.append(
+                    CodeOwnersLine(
+                        line_number=line_num,
+                        raw=raw,
+                        line_type=LineType.SECTION,
+                        section=section_name,
+                    )
+                )
+                continue
 
-            rules.append(
-                CodeownersRule(
+            # Regular rule line
+            pattern, owners, comment = split_codeowners_line(raw)
+            parsed.append(
+                CodeOwnersLine(
+                    line_number=line_num,
+                    raw=raw,
+                    line_type=LineType.RULE,
                     pattern=pattern,
-                    owners=final_owners,
-                    line_number=idx,
-                    raw_line=line,
-                    comment=trailing_comment,
+                    owners=owners,
                     section=current_section,
+                    comment=comment,
                 )
             )
 
-        return ParsedCodeowners(
-            rules=rules,
-            sections=sections,
-            raw_lines=lines,
-            comments=comments,
-        )
+        return parsed
 
-
-def parse_codeowners(content: str) -> ParsedCodeowners:
-    """Helper shortcut to parse CODEOWNERS content."""
-    return CodeownersParser().parse(content)
+    @classmethod
+    def parse_file(cls, path: Path) -> List[CodeOwnersLine]:
+        """Reads and parses a CODEOWNERS file."""
+        content = path.read_text(encoding="utf-8")
+        return cls.parse_text(content)

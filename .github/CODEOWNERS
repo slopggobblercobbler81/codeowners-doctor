@@ -1,3 +1,13 @@
 # CODEOWNERS for codeowners-doctor
-* @slopggobblercobbler81
-.github/workflows/ @slopggobblercobbler81
+
+# Global repo maintainer
+*                           @slopggobblercobbler81
+
+# Core doctor logic
+/codeowners_doctor/         @slopggobblercobbler81
+
+# CI and Workflows
+/.github/workflows/         @slopggobblercobbler81
+
+# Documentation
+/README.md                  @slopggobblercobbler81

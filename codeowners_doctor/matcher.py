@@ -1,160 +1,206 @@
-"""Pattern matching engine for CODEOWNERS files."""
-
+"""Pattern matching engine for CODEOWNERS."""
 from __future__ import annotations
-import os
+
 import re
-from typing import List, Optional, Tuple, Pattern
-from .parser import CodeownersRule, ParsedCodeowners
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
+
+from codeowners_doctor.models import CodeOwnersLine, LineType, MatchResult
 
 
-def normalize_repo_path(path: str) -> str:
-    """Normalize file path to unix-style relative path without leading ./ or /."""
-    p = path.replace("\\", "/").strip()
-    if p.startswith("./"):
-        p = p[2:]
-    if p.startswith("/"):
-        p = p[1:]
-    return p
-
-
-def pattern_to_regex(pattern: str) -> Pattern[str]:
-    """Convert a CODEOWNERS pattern into a compiled regex pattern.
+def compile_pattern_to_regex(raw_pattern: str) -> re.Pattern:
+    """Compiles a CODEOWNERS glob pattern into a compiled regex.
     
-    GitHub CODEOWNERS glob matching semantics:
-    - Leading slash (/foo) anchors pattern to root of repo.
-    - Pattern containing slash in middle (foo/bar) is also anchored to root.
-    - Pattern without slash (or only trailing slash) matches at any directory depth.
-    - Pattern ending with / matches directory and all its contents recursively.
-    - Asterisk (*) matches zero or more non-slash characters.
-    - Double asterisk (**) matches zero or more characters including slashes.
+    Rules according to GitHub / git CODEOWNERS spec:
+    - '*' alone matches all files across all directories.
+    - '/*' matches only top-level files in the repo root.
+    - Patterns starting with '/' are anchored to the repo root.
+    - Patterns with a slash in the middle (not just trailing) are anchored to repo root.
+    - Patterns ending in '/' match that directory and all files within it recursively.
+    - Patterns without any slash match anywhere in the tree.
+    - '**' matches zero or more directories.
     """
-    raw = pattern.strip()
-    if not raw:
-        return re.compile(r"^$")
+    pattern = raw_pattern.strip()
 
-    # Special case: '*' matches everything in repo
-    if raw == "*":
+    # Universal wildcard
+    if pattern == "*":
         return re.compile(r"^.*$")
 
-    is_dir_only = raw.endswith("/")
-    if is_dir_only:
-        raw = raw[:-1]
+    # Root files only
+    if pattern == "/*":
+        return re.compile(r"^[^/]+$")
 
-    # Check anchoring:
-    # Starts with '/' -> anchored
-    # Contains '/' -> anchored
-    # Neither -> unanchored (matches anywhere)
-    is_anchored = False
-    if raw.startswith("/"):
-        is_anchored = True
-        raw = raw[1:]
-    elif "/" in raw:
-        is_anchored = True
+    anchored_to_root = False
+    if pattern.startswith("/"):
+        anchored_to_root = True
+        pattern = pattern[1:]
 
-    # Translate glob tokens into regex
+    matches_directory_recursively = False
+    if pattern.endswith("/"):
+        matches_directory_recursively = True
+        pattern = pattern[:-1]
+
+    # Check for slash in the middle
+    if "/" in pattern:
+        # If it has a slash in the middle (and didn't start with **/), it's anchored to root
+        if not pattern.startswith("**/"):
+            anchored_to_root = True
+
+    # Build regex from glob pattern tokens
     regex_parts: List[str] = []
     i = 0
-    n = len(raw)
+    n = len(pattern)
 
     while i < n:
-        c = raw[i]
+        c = pattern[i]
 
         if c == "\\":
             if i + 1 < n:
-                regex_parts.append(re.escape(raw[i + 1]))
+                regex_parts.append(re.escape(pattern[i + 1]))
                 i += 2
+                continue
             else:
-                regex_parts.append(re.escape("\\"))
+                regex_parts.append(re.escape(c))
                 i += 1
-            continue
+                continue
 
         if c == "*":
-            if i + 1 < n and raw[i + 1] == "*":
-                # Double asterisk
-                i += 2
-                if i < n and raw[i] == "/":
-                    # **/ -> matches zero or more directories
+            if i + 1 < n and pattern[i + 1] == "*":
+                # Double asterisk '**'
+                # Check surrounding slashes
+                # e.g., '**/', '/**', '/**/'
+                prev_slash = i > 0 and pattern[i - 1] == "/"
+                next_slash = i + 2 < n and pattern[i + 2] == "/"
+
+                if prev_slash and next_slash:
+                    # 'foo/**/bar' -> foo/(?:.+/)?bar
+                    regex_parts.append(r"(?:.+/)?")
+                    i += 3
+                    continue
+                elif next_slash:
+                    # '**/bar' -> (?:.*/)?bar
                     regex_parts.append(r"(?:.*/)?")
-                    i += 1
+                    i += 3
+                    continue
+                elif prev_slash:
+                    # 'foo/**' -> foo/.*
+                    regex_parts.append(r".*")
+                    i += 2
+                    continue
                 else:
                     regex_parts.append(r".*")
+                    i += 2
+                    continue
             else:
+                # Single asterisk '*' matches anything except '/'
                 regex_parts.append(r"[^/]*")
                 i += 1
-            continue
+                continue
 
         if c == "?":
             regex_parts.append(r"[^/]")
             i += 1
             continue
 
-        if c == ".":
-            regex_parts.append(r"\.")
-            i += 1
-            continue
+        if c == "[":
+            # Character class
+            j = i + 1
+            if j < n and pattern[j] == "!":
+                j += 1
+            if j < n and pattern[j] == "]":
+                j += 1
+            while j < n and pattern[j] != "]":
+                j += 1
+            if j < n:
+                char_class = pattern[i : j + 1]
+                # convert [!abc] to [^abc]
+                if char_class.startswith("[!"):
+                    char_class = "[^" + char_class[2:]
+                regex_parts.append(char_class)
+                i = j + 1
+                continue
 
-        if c in ("+", "^", "$", "(", ")", "[", "]", "{", "}", "|"):
-            regex_parts.append(re.escape(c))
-            i += 1
-            continue
-
-        regex_parts.append(c)
+        # Regular characters
+        regex_parts.append(re.escape(c))
         i += 1
 
     pattern_body = "".join(regex_parts)
 
-    if is_dir_only:
-        # Must match directory itself or any file under that directory
-        if is_anchored:
-            final_regex = rf"^{pattern_body}(?:/.*)?$"
+    if matches_directory_recursively:
+        # Directory pattern: matches files directly in or inside subdirectories
+        if anchored_to_root:
+            regex_str = rf"^{pattern_body}(?:/.*)?$"
         else:
-            final_regex = rf"(?:^|.*/){pattern_body}(?:/.*)?$"
+            regex_str = rf"^(?:.*/)?{pattern_body}(?:/.*)?$"
     else:
-        # Match exact file/dir or if it is a directory, match its contents
-        if is_anchored:
-            final_regex = rf"^{pattern_body}(?:/.*)?$"
+        # File or directory pattern:
+        # If it's anchored to root:
+        if anchored_to_root:
+            regex_str = rf"^{pattern_body}(?:/.*)?$"
         else:
-            final_regex = rf"(?:^|.*/){pattern_body}(?:/.*)?$"
+            # Can match anywhere in the hierarchy, or matches a directory whose contents match
+            regex_str = rf"^(?:.*/)?{pattern_body}(?:/.*)?$"
 
-    return re.compile(final_regex)
+    return re.compile(regex_str)
 
 
-class CodeownersMatcher:
-    """Matches repository paths against CODEOWNERS rules using GitHub evaluation order."""
+class CodeOwnersMatcher:
+    """Matches files against parsed CODEOWNERS rules using GitHub precedence."""
 
-    def __init__(self, parsed_or_rules: ParsedCodeowners | List[CodeownersRule]) -> None:
-        if isinstance(parsed_or_rules, ParsedCodeowners):
-            self.rules = parsed_or_rules.rules
-        else:
-            self.rules = list(parsed_or_rules)
+    def __init__(self, rules: List[CodeOwnersLine]):
+        self.raw_rules = rules
+        self.compiled_rules: List[Tuple[CodeOwnersLine, re.Pattern]] = []
 
-        self._compiled: List[Tuple[CodeownersRule, Pattern[str]]] = [
-            (rule, pattern_to_regex(rule.pattern)) for rule in self.rules
-        ]
+        for rule in rules:
+            if rule.line_type == LineType.RULE and rule.pattern:
+                try:
+                    regex = compile_pattern_to_regex(rule.pattern)
+                    self.compiled_rules.append((rule, regex))
+                except re.error:
+                    # Malformed regex pattern will be flagged by linter
+                    pass
 
-    def find_all_matching_rules(self, path: str) -> List[CodeownersRule]:
-        """Return all rules matching path in file order."""
-        norm_path = normalize_repo_path(path)
-        return [rule for rule, reg in self._compiled if reg.match(norm_path)]
+    @staticmethod
+    def normalize_path(path_str: str) -> str:
+        """Converts Windows or POSIX path to normalized repo-relative POSIX path."""
+        p = path_str.replace("\\", "/").strip()
+        while p.startswith("/"):
+            p = p[1:]
+        return p
 
-    def find_matching_rule(self, path: str) -> Optional[CodeownersRule]:
-        """Find the effective winning rule for path.
+    def match_file(self, file_path: str) -> MatchResult:
+        """Finds the winning CODEOWNERS rule for a single file.
         
-        In CODEOWNERS, rules are evaluated top-to-bottom and the LAST match wins.
+        According to GitHub spec, the last matching rule in the file wins.
         """
-        norm_path = normalize_repo_path(path)
-        for rule, reg in reversed(self._compiled):
-            if reg.match(norm_path):
-                return rule
-        return None
+        norm_path = self.normalize_path(file_path)
 
-    def get_owners(self, path: str) -> Tuple[str, ...]:
-        """Get the owners tuple for path. Empty tuple if unowned or unmatched."""
-        rule = self.find_matching_rule(path)
-        if rule is None:
-            return ()
-        return rule.owners
+        winning_rule: Optional[CodeOwnersLine] = None
 
-    def is_owned(self, path: str) -> bool:
-        """Check if path has at least one owner assigned."""
-        return len(self.get_owners(path)) > 0
+        # Last matching pattern takes precedence
+        for rule, regex in self.compiled_rules:
+            if regex.match(norm_path):
+                winning_rule = rule
+
+        if winning_rule:
+            return MatchResult(
+                file_path=norm_path,
+                matched=True,
+                rule_line_number=winning_rule.line_number,
+                pattern=winning_rule.pattern,
+                owners=winning_rule.owners,
+                section=winning_rule.section,
+            )
+
+        return MatchResult(
+            file_path=norm_path,
+            matched=False,
+            rule_line_number=None,
+            pattern=None,
+            owners=[],
+            section=None,
+        )
+
+    def match_all(self, file_paths: List[str]) -> Dict[str, MatchResult]:
+        """Matches a list of file paths and returns results mapped by file path."""
+        return {fp: self.match_file(fp) for fp in file_paths}

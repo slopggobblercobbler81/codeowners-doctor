@@ -1,1 +1,1 @@
-"""Tests for codeowners-doctor."""
+"""Test suite for codeowners-doctor."""
