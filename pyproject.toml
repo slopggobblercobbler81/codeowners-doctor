@@ -1,0 +1,67 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "codeowners-doctor"
+version = "0.1.0"
+description = "Production-grade CODEOWNERS validator, ownership auditor, linter, and formatter for CI/CD."
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+authors = [
+    { name = "slopggobblercobbler81" }
+]
+keywords = [
+    "codeowners",
+    "github",
+    "gitlab",
+    "git",
+    "linter",
+    "cli",
+    "ownership",
+    "ci",
+    "sarif",
+    "developer-tools",
+    "code-quality"
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.8",
+    "Programming Language :: Python :: 3.9",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Software Development :: Version Control :: Git",
+    "Topic :: Software Development :: Quality Assurance",
+    "Topic :: Utilities"
+]
+dependencies = []
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=4.0.0"
+]
+
+[project.scripts]
+codeowners-doctor = "codeowners_doctor.cli:main"
+codeowners = "codeowners_doctor.cli:main"
+
+[project.urls]
+Homepage = "https://github.com/slopggobblercobbler81/codeowners-doctor"
+Repository = "https://github.com/slopggobblercobbler81/codeowners-doctor"
+Issues = "https://github.com/slopggobblercobbler81/codeowners-doctor/issues"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+addopts = "-v --strict-markers"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["codeowners_doctor*"]
